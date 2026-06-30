@@ -371,6 +371,8 @@ def main() -> None:
     p.add_argument("--out-dir", type=Path, required=True)
     p.add_argument("--total-steps", type=int, default=None)
     p.add_argument("--manifest", type=Path, default=None)
+    p.add_argument("--data-base-dir", type=Path, default=None,
+                   help="Pin shard-resolution dir (runner-supplied; overrides config data_base_dir).")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--wandb", action="store_true", help="Log to Weights & Biases (requires `pip install wandb`)")
     args = p.parse_args()
@@ -385,6 +387,8 @@ def main() -> None:
         cfg.total_steps = args.total_steps
     if args.manifest is not None:
         cfg.manifest_path = str(args.manifest)
+    if args.data_base_dir is not None:
+        cfg.data_base_dir = str(args.data_base_dir)
     if args.seed is not None:
         cfg.init_seed = args.seed
         cfg.data_seed = args.seed
