@@ -20,7 +20,7 @@ import os
 import random
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -75,6 +75,7 @@ class TrainConfig:
 
     # Logging
     log_every: int = 10
+    checkpoint_steps: list = field(default_factory=list)
 
     @property
     def grad_accum_steps(self) -> int:
@@ -270,6 +271,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     start = time.time()
     tokens_seen = 0
     last_loss = float("nan")
+    _ckpt_set = set(cfg.checkpoint_steps)
     for step in range(cfg.total_steps):
         lr = cosine_lr(step, cfg)
         # Scale each optimizer's per-group base_lr by the schedule fraction so
@@ -324,6 +326,11 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
                 f"|g|={grad_norm:.2f} tok/s={tok_per_s:,.0f}",
                 flush=True,
             )
+        if step + 1 in _ckpt_set:
+            _mid_ckpt = out_dir / f"checkpoint_step{step+1:06d}.pt"
+            torch.save({"model": model.state_dict(), "config": asdict(cfg), "step": step + 1}, _mid_ckpt)
+            (out_dir / f".ckpt_ready_{step+1}").touch()
+            print(f"[train] checkpoint {step+1}: saved", flush=True)
         if (step % 2000 == 0 and step > 0) or step == cfg.total_steps - 1:
             _ckpt_dir = out_dir / "checkpoints"
             _ckpt_dir.mkdir(exist_ok=True)
