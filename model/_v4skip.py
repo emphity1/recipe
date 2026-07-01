@@ -140,25 +140,14 @@ class SwiGLU(nn.Module):
 class Block(nn.Module):
     def __init__(self, cfg: RalphConfig):
         super().__init__()
-        # Sandwich-LN: the base peri-LN normalizes only the sublayer OUTPUT
-        # (x = x + norm(sublayer(x))) and feeds each sublayer the RAW, depth-growing
-        # residual stream as input. Adding a pre-norm on the INPUT as well —
-        # x = x + out_norm(sublayer(in_norm(x))) — bounds the sublayer's input scale
-        # so the attention/FFN see a well-conditioned, unit-scale signal at every
-        # depth. This is the dominant stabilizer at HIGH LR: it removes the only
-        # remaining unnormalized path (FFN input; attention otherwise leans on
-        # QK-norm), letting the optimizer push the LR higher before the deeper
-        # layers' growing-magnitude inputs would otherwise blow up the update.
-        self.attn_in_norm = RMSNorm(cfg.dim, cfg.rms_norm_eps)
         self.attn_norm = RMSNorm(cfg.dim, cfg.rms_norm_eps)
         self.attn = Attention(cfg)
-        self.ffn_in_norm = RMSNorm(cfg.dim, cfg.rms_norm_eps)
         self.ffn_norm = RMSNorm(cfg.dim, cfg.rms_norm_eps)
         self.ffn = SwiGLU(cfg)
 
     def forward(self, x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn_norm(self.attn(self.attn_in_norm(x), rope_cache))
-        x = x + self.ffn_norm(self.ffn(self.ffn_in_norm(x)))
+        x = x + self.attn(self.attn_norm(x), rope_cache)
+        x = x + self.ffn(self.ffn_norm(x))
         return x
 
 
@@ -183,23 +172,6 @@ class RalphBase(nn.Module):
             self.lm_head = None
         else:
             self.lm_head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
-        # Learned scalar readout temperature for the (tied) head. With weight
-        # tying, the embedding matrix's norm sets BOTH the input-embedding scale
-        # (init_std=0.02) and the readout/logit scale; the model cannot move one
-        # without moving the other. This single scalar decouples the readout gain
-        # from the embedding norm so the softmax temperature is fit directly.
-        # exp() parameterisation keeps it strictly positive; 0-init => gain 1.0,
-        # so the run starts bit-identical to the reordered base and learns away.
-        # Shape () => 1D => routed to AdamW(no-decay) by build_optimizer.
-        self.logit_scale = nn.Parameter(torch.zeros(()))
-        # Per-vocab readout calibration, composing with the scalar logit_scale: a
-        # per-token multiplicative GAIN and additive BIAS on the tied head. The tied
-        # matrix shares input/output roles and has no bias term, so per-token readout
-        # sharpness (gain) and the unigram prior (bias) cannot be expressed; these fit
-        # them directly. 0-init => exp(0)=1 and +0 => identity at step 0. Both shape
-        # (vocab,) => 1D => AdamW(no-decay).
-        self.readout_gain = nn.Parameter(torch.zeros(cfg.vocab_size))
-        self.readout_bias = nn.Parameter(torch.zeros(cfg.vocab_size))
         self.register_buffer(
             "rope_cache",
             precompute_rope_cache(cfg.head_dim, cfg.max_seq_len, cfg.rope_base, torch.device("cpu")),
@@ -245,13 +217,6 @@ class RalphBase(nn.Module):
             logits = F.linear(x, self.tok_embed.weight)
         else:
             logits = self.lm_head(x)
-        # Apply the learned readout temperature before the soft-cap. exp(0)=1 at
-        # init so this is an identity at step 0; the optimizer then sets the
-        # readout gain independently of the tied embedding norm.
-        # Per-vocab readout gain (per-token temperature) + bias (per-token prior),
-        # then the global temperature, all before the soft-cap. Identity at init.
-        logits = logits * torch.exp(self.readout_gain) + self.readout_bias
-        logits = logits * torch.exp(self.logit_scale)
         cap = getattr(self.cfg, "logit_softcap", 0.0)  # recipe-v4: logit soft-cap
         if cap and cap > 0:
             logits = cap * torch.tanh(logits / cap)
