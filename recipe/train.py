@@ -116,9 +116,6 @@ def build_model(cfg: TrainConfig) -> RalphBase:
         head_dim=cfg.head_dim,
         ffn_mult=cfg.ffn_mult,
         max_seq_len=cfg.max_seq_len,
-        rope_base=10000.0,
-        unet_skip=False,
-        logit_softcap=0.0,
     ))
 
 
