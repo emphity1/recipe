@@ -1,0 +1,1 @@
+{"vocab_size":50257,"dim":1024,"n_layers":16,"n_heads":16,"head_dim":64,"ffn_mult":2.6875,"max_seq_len":1024,"seq_len":1024,"batch_size":128,"micro_batch_size":32,"total_steps":200,"warmup_steps":10,"max_lr":0.0003,"min_lr":3e-05,"weight_decay":0.1,"beta1":0.9,"beta2":0.95,"grad_clip":1.0,"log_every":10}
