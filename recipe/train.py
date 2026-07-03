@@ -55,7 +55,6 @@ class TrainConfig:
     beta1: float = 0.9
     beta2: float = 0.95
     grad_clip: float = 1.0
-    z_loss_coef: float = 0.0  # optional logit-scale (z-loss) regularizer; 0 = off (canonical)
 
     # Optimizer. "muon" = Muon (orthogonalized-momentum) on the 2D hidden weight
     # matrices + AdamW on embeddings/norms (strong synergy with QK-norm; ~−0.13
@@ -288,9 +287,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
             inp = inp.to(device, non_blocking=True)
             tgt = tgt.to(device, non_blocking=True)
             with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
-                logits, loss = model(inp, targets=tgt)
-            if getattr(cfg, "z_loss_coef", 0.0):
-                loss = loss + cfg.z_loss_coef * (torch.logsumexp(logits.float(), dim=-1) ** 2).mean()
+                _, loss = model(inp, targets=tgt)
             scaled_loss = loss / cfg.grad_accum_steps
             scaled_loss.backward()
             step_loss += loss.item() / cfg.grad_accum_steps
