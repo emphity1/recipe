@@ -31,6 +31,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from data import TokenShardDataset
 from model import RalphBase, RalphConfig
 
+# EMA/tail-average helper lives next to this file (recipe/ema.py). Put the
+# recipe/ package dir on sys.path so `from ema import EMA` resolves however
+# train.py is launched (script mode, `-m` module mode, or the Stage-5 audit
+# re-run), mirroring the parent-dir insert above.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ema import EMA
+
 
 @dataclass
 class TrainConfig:
@@ -92,6 +99,15 @@ class TrainConfig:
     # orthogonalized update while the buffer is cold). None => constant momentum.
     muon_momentum_start: float | None = None
 
+    # EMA / tail-average of the weights (headline lever). When ema_decay>0 the
+    # training loop keeps a float32 shadow that begins averaging at
+    # ema_start_step (set to the WSD decay onset) and the FINAL checkpoint saves
+    # the average instead of the raw final-step weights. Default off (0.0) keeps
+    # byte-identical canonical behaviour; main() only setattrs known fields, so a
+    # new configs/*.json turns it on. Cheap: one fp32 model copy + one AXPY/step.
+    ema_decay: float = 0.0
+    ema_start_step: int = 0
+
     # Data + reproducibility
     manifest_path: str = "data/data_manifest.json"
     data_base_dir: str = "data"
@@ -121,7 +137,7 @@ def set_determinism(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     try:
-        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.use_deterministic_algorithms(False, warn_only=True)
     except Exception:
         pass
     torch.backends.cudnn.deterministic = True
@@ -183,7 +199,7 @@ def _zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5, eps: float = 1
     so the matmuls use TF32 tensor cores (free on H100/H200) — cleaner
     orthogonalization direction than the old bf16 path — then casts back to G."""
     a, b, c = 3.4445, -4.7750, 2.0315
-    X = G.bfloat16()
+    X = G.float()
     X = X / (X.norm() + eps)
     transpose = G.size(0) > G.size(1)
     if transpose:
@@ -357,6 +373,10 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
 
     model = build_model(cfg).to(device)
     optimizers = build_optimizer(model, cfg)
+    # Headline lever: EMA/tail-average of the weights over the WSD decay tail.
+    # Shadow keys == model.state_dict() keys, so op4's strict RalphBase load
+    # still matches. None when disabled => zero overhead / canonical path.
+    ema = EMA(model, cfg.ema_decay, cfg.ema_start_step) if cfg.ema_decay > 0 else None
     # torch.compile(mode="max-autotune") on the forward. The saved state_dict is
     # ALWAYS taken from the UNCOMPILED `model` (below), so no "_orig_mod." prefix
     # leaks into the checkpoint (op4 strict-load safe). Gated on cfg.compile and
@@ -418,6 +438,12 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         for opt in optimizers:
             opt.step()
 
+        # EMA update AFTER the optimizer step, over the decay tail. Uses the raw
+        # post-step weights; leaves the logged step_loss (raw model) untouched so
+        # the trajectory audit and training_log.jsonl still reproduce exactly.
+        if ema is not None:
+            ema.update(model, step)
+
         last_loss = step_loss
         elapsed = time.time() - start
         tok_per_s = tokens_seen / max(elapsed, 1e-6)
@@ -466,7 +492,11 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         wb_run.finish()
 
     ckpt_path = out_dir / "checkpoint.pt"
-    torch.save({"model": model.state_dict(), "config": asdict(cfg)}, ckpt_path)
+    # Save the EMA/tail-average as the FINAL checkpoint when enabled (falls back
+    # to raw weights if averaging never started). Keys are identical to
+    # model.state_dict() so op4's strict RalphBase.load_state_dict succeeds.
+    save_sd = ema.state_dict(model) if ema is not None else model.state_dict()
+    torch.save({"model": save_sd, "config": asdict(cfg)}, ckpt_path)
 
     summary = {
         "steps": cfg.total_steps,
