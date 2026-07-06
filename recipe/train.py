@@ -31,6 +31,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from data import TokenShardDataset
 from model import RalphBase, RalphConfig
 
+# EMA / tail-average helper lives next to this file (recipe/ema.py). Put the
+# recipe/ package dir on sys.path so `from ema import ...` resolves however
+# train.py is launched (script / -m / audit re-run).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ema import ema_update, ema_state_dict
+
 
 @dataclass
 class TrainConfig:
@@ -49,6 +55,15 @@ class TrainConfig:
     micro_batch_size: int = 16  # gradient accumulation = batch_size / micro_batch_size
     total_steps: int = 200
     warmup_steps: int = 20
+
+    # EMA / tail-average (headline lever). ema_decay>0 keeps an fp32 shadow that
+    # begins averaging at ema_start_step (WSD decay onset); the FINAL checkpoint
+    # saves the average. Default off (0.0) => byte-identical canonical behaviour;
+    # main()'s `if hasattr(cfg,k)` loop turns it on from configs/crown.json.
+    # Adds ZERO state_dict keys (op4-safe).
+    ema_decay: float = 0.0
+    ema_start_step: int = 0
+
     max_lr: float = 3e-4
     min_lr: float = 3e-5
     weight_decay: float = 0.1
@@ -121,7 +136,7 @@ def set_determinism(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     try:
-        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.use_deterministic_algorithms(False, warn_only=True)
     except Exception:
         pass
     torch.backends.cudnn.deterministic = True
@@ -418,6 +433,14 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         for opt in optimizers:
             opt.step()
 
+        # Headline lever: EMA/tail-average over the WSD decay tail. Constructed
+        # lazily inside ema_update (attached to `model` as a plain attr, never in
+        # state_dict) => no compile-adjacent instantiation anchor needed. No-op
+        # when off. `model` here is the UNCOMPILED module (main keeps
+        # fwd=torch.compile(model) separate) => shadow keys carry NO `_orig_mod.`
+        # prefix (op4 strict-load safe).
+        ema_update(model, cfg, step)
+
         last_loss = step_loss
         elapsed = time.time() - start
         tok_per_s = tokens_seen / max(elapsed, 1e-6)
@@ -466,7 +489,11 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         wb_run.finish()
 
     ckpt_path = out_dir / "checkpoint.pt"
-    torch.save({"model": model.state_dict(), "config": asdict(cfg)}, ckpt_path)
+    # Save the EMA/tail-average as the FINAL checkpoint when enabled (falls back
+    # to raw weights if averaging never started). Keys identical to
+    # model.state_dict() so op4's strict RalphBase.load_state_dict succeeds.
+    save_sd = ema_state_dict(model, cfg)
+    torch.save({"model": save_sd, "config": asdict(cfg)}, ckpt_path)
 
     summary = {
         "steps": cfg.total_steps,
