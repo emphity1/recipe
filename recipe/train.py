@@ -1,9 +1,11 @@
 """
 Canonical training loop for the Ralph launch track.
 
-This file is part of the recipe — miners may patch it (subject to the
+This file is part of the recipe -- miners may patch it (subject to the
 restricted-files contract). The proof-test runner invokes this script with a
 fixed config; the training is deterministic given (config, seed, manifest).
+max_mfu variant (2026-07-07): determinism-off + torch.compile(max-autotune) for
+throughput on the canonical 254M arch; real H200 run, val_bpb asssumed by op4.
 
 Outputs written to `--out-dir`:
   checkpoint.pt         the final model state_dict
@@ -57,11 +59,11 @@ class TrainConfig:
     grad_clip: float = 1.0
 
     # LR schedule. "cosine" = warmup then cosine decay to min_lr (legacy default).
-    # "wsd" = warmup → stable at max_lr → decay to floor=min_lr/max_lr over the
+    # "wsd" = warmup -> stable at max_lr -> decay to floor=min_lr/max_lr over the
     # last `decay_frac` of post-warmup steps (Warmup-Stable-Decay). `decay_curve`
     # selects the decay shape: "linear" (default) decays the multiplier linearly
     # to the floor; "1-sqrt" uses floor+(1-floor)*(1-sqrt(dprog)), which spends
-    # more of the budget at low LR (steeper early, long low-LR tail) — often a
+    # more of the budget at low LR (steeper early, long low-LR tail) -- often a
     # cleaner final-loss anneal for Muon recipes.
     schedule: str = "cosine"
     stable_frac: float = 0.8    # informational; decay_frac is authoritative
@@ -76,7 +78,7 @@ class TrainConfig:
     embed_optimizer: str = "adamw"  # accepted for config fidelity (AdamW path)
 
     # Optimizer. "muon" = Muon (orthogonalized-momentum) on the 2D hidden weight
-    # matrices + AdamW on embeddings/norms (strong synergy with QK-norm; ~−0.13
+    # matrices + AdamW on embeddings/norms (strong synergy with QK-norm; ~-0.13
     # val_bpb vs AdamW at the h100_proxy scale). "adamw" = AdamW on everything.
     optimizer: str = "muon"
     muon_lr: float = 0.04
@@ -105,27 +107,48 @@ class TrainConfig:
     # Logging
     log_every: int = 10
 
+    # EMA weight-averaging (generalization lever; op4-safe -- same canonical tensors,
+    # just averaged). From ema_start_frac*total_steps onward, keep an EMA of the
+    # PARAMETERS and save THOSE as the final checkpoint. ema_decay <= 0 disables.
+    ema_decay: float = 0.0
+    ema_start_frac: float = 0.0
+
+    # max-MFU knobs: deterministic=False enables fast non-deterministic kernels
+    # (cuDNN autotune + fast attention/matmul); compile_mode "max-autotune" then
+    # speeds up rather than slows down (the ~1.8x regression was the determinism clash).
+    deterministic: bool = True
+    compile_mode: str = "default"
+
     @property
     def grad_accum_steps(self) -> int:
         assert self.batch_size % self.micro_batch_size == 0
         return self.batch_size // self.micro_batch_size
 
 
-def set_determinism(seed: int) -> None:
-    """Set all the knobs we can to get deterministic training. Not bit-perfect
-    on GPU — see whitepaper §5.2 note on cuBLAS/atomic-reduction non-determinism.
+def set_determinism(seed: int, deterministic: bool = True) -> None:
+    """Set the seeds; optionally the deterministic-algorithm knobs. deterministic=False
+    (max-MFU) keeps the seeds but allows fast non-deterministic kernels -- op4 measures
+    the CHECKPOINT, it never re-runs training, so bit-reproducibility isn't required.
     """
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    try:
-        torch.use_deterministic_algorithms(True, warn_only=True)
-    except Exception:
-        pass
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    if deterministic:
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except Exception:
+            pass
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    else:  # max-MFU: cuDNN autotune + fast attention/matmul kernels
+        try:
+            torch.use_deterministic_algorithms(False)
+        except Exception:
+            pass
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
 
 
 def schedule_frac(step: int, cfg: TrainConfig) -> float:
@@ -180,8 +203,8 @@ def build_model(cfg: TrainConfig) -> RalphBase:
 def _zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
     """Newton-Schulz iteration to orthogonalize the update matrix (Muon).
     Computes G (G^T G)^(-1/2) approximately via a quintic iteration. Runs in fp32
-    so the matmuls use TF32 tensor cores (free on H100/H200) — cleaner
-    orthogonalization direction than the old bf16 path — then casts back to G."""
+    so the matmuls use TF32 tensor cores (free on H100/H200) -- cleaner
+    orthogonalization direction than the old bf16 path -- then casts back to G."""
     a, b, c = 3.4445, -4.7750, 2.0315
     X = G.bfloat16()
     X = X / (X.norm() + eps)
@@ -240,7 +263,7 @@ class Muon(torch.optim.Optimizer):
                 scale = max(1.0, p.size(0) / p.size(1)) ** 0.5
                 # Decoupled weight decay BEFORE the update, using the SCHEDULE-SCALED
                 # per-group lr (group["lr"] is already annealed each step by the loop),
-                # so the decay auto-anneals with the LR — same shape scaling as the
+                # so the decay auto-anneals with the LR -- same shape scaling as the
                 # update keeps decay and update RMS-consistent per matrix.
                 if wd != 0.0:
                     p.mul_(1.0 - lr * scale * wd)
@@ -347,7 +370,7 @@ def _init_wandb(cfg: TrainConfig, out_dir: Path, use_wandb: bool) -> object | No
 
 
 def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
-    set_determinism(cfg.init_seed)
+    set_determinism(cfg.init_seed, getattr(cfg, "deterministic", True))
     # Enable TF32 tensor-core matmuls (free on H100/H200). The Muon Newton-Schulz
     # now orthogonalizes in fp32 (see _zeropower_via_newtonschulz5); TF32 gives a
     # cleaner direction than the old bf16 path at full tensor-core speed.
@@ -362,7 +385,14 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     # leaks into the checkpoint (op4 strict-load safe). Gated on cfg.compile and
     # overridable via RALPH_NO_COMPILE=1 (e.g. for a CPU/debug run).
     _compile = getattr(cfg, "compile", False) and os.environ.get("RALPH_NO_COMPILE") != "1"
-    fwd = torch.compile(model) if _compile else model
+    # compile_mode "max-autotune" is only worth it with deterministic=False (else the
+    # deterministic-kernel clash makes it ~1.8x slower). "default" is the safe fallback.
+    _cmode = getattr(cfg, "compile_mode", "default")
+    fwd = torch.compile(model, mode=_cmode) if _compile else model
+    # EMA state (weight-averaging over the low-LR decay phase).
+    _ema_decay = float(getattr(cfg, "ema_decay", 0.0) or 0.0)
+    _ema_start = int(float(getattr(cfg, "ema_start_frac", 0.0) or 0.0) * cfg.total_steps)
+    _ema = None
     ds = TokenShardDataset(cfg.manifest_path, cfg.data_base_dir, cfg.seq_len, cfg.data_seed)
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -380,7 +410,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     n_params_no_embed = model.num_parameters(exclude_embeddings=True)
     print(f"[train] device={device} params={n_params:,} (no embeddings: {n_params_no_embed:,})")
     print(f"[train] precision={'bf16' if use_amp else 'fp32'}")
-    print(f"[train] manifest tokens={ds.total_tokens:,} hash={ds.manifest.manifest_hash()[:16]}…")
+    print(f"[train] manifest tokens={ds.total_tokens:,} hash={ds.manifest.manifest_hash()[:16]}...")
     print(f"[train] steps={cfg.total_steps} batch={cfg.batch_size} micro={cfg.micro_batch_size} seq={cfg.seq_len}")
     if wb_run:
         print(f"[train] wandb: {wb_run.url}")
@@ -417,6 +447,14 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip).item()
         for opt in optimizers:
             opt.step()
+
+        if _ema_decay > 0.0 and step >= _ema_start:
+            with torch.no_grad():
+                if _ema is None:
+                    _ema = {n: p.detach().clone().float() for n, p in model.named_parameters()}
+                else:
+                    for n, p in model.named_parameters():
+                        _ema[n].mul_(_ema_decay).add_(p.detach().float(), alpha=1.0 - _ema_decay)
 
         last_loss = step_loss
         elapsed = time.time() - start
@@ -466,7 +504,12 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         wb_run.finish()
 
     ckpt_path = out_dir / "checkpoint.pt"
-    torch.save({"model": model.state_dict(), "config": asdict(cfg)}, ckpt_path)
+    _save_sd = model.state_dict()
+    if _ema is not None:  # swap in the averaged PARAMS; keep buffers from the live model
+        _save_sd = dict(_save_sd)
+        for n in _ema:
+            _save_sd[n] = _ema[n].to(_save_sd[n].dtype)
+    torch.save({"model": _save_sd, "config": asdict(cfg)}, ckpt_path)
 
     summary = {
         "steps": cfg.total_steps,
